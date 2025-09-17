@@ -924,4 +924,438 @@ object ForkJoinPoolMonitor {
 
 ---
 
+Отличные вопросы! Давайте разберемся по порядку.
+
+## 📦 **1. Что лучше: Extension или Object?**
+
+### **ClassPreloadingExtension - лучше!**
+**Почему:** Он гарантирует **однократное выполнение** на весь test run.
+
+```kotlin
+import org.junit.jupiter.api.extension.BeforeAllCallback
+import org.junit.jupiter.api.extension.ExtensionContext
+
+class ClassPreloadingExtension : BeforeAllCallback {
+    
+    companion object {
+        @Volatile
+        private var preloaded = false
+        private val lock = Any()
+    }
+    
+    override fun beforeAll(context: ExtensionContext) {
+        if (!preloaded) {
+            synchronized(lock) {
+                if (!preloaded) {
+                    println("⏳ Preloading classes...")
+                    PreloadUtils.preloadCriticalClasses()
+                    preloaded = true
+                    println("✅ Classes preloaded")
+                }
+            }
+        }
+    }
+}
+```
+
+### **Object ClassPreloader - риск двойного выполнения**
+Может вызваться несколько раз в параллельных тестах.
+
+## 🔒 **2. Static блоки в Kotlin**
+
+**В Kotlin нет точного аналога `static {}`, но есть:**
+
+### **а) Companion object + `init` блок**
+```kotlin
+class MyClass {
+    companion object {
+        init {
+            // Аналог static {} - выполняется при первом обращении к классу
+            println("This runs like static block")
+        }
+    }
+}
+```
+
+### **б) Top-level initialization**
+```kotlin
+// Файл MyUtils.kt
+val initialized = run {
+    println("This runs on class loading")
+    "initial value"
+}
+```
+
+### **в) `@JvmStatic` + `init`**
+```kotlin
+class MyClass {
+    companion object {
+        @JvmStatic
+        val MY_CONSTANT = computeValue()
+        
+        private fun computeValue(): String {
+            println("Like static block")
+            return "value"
+        }
+    }
+}
+```
+
+## 🚀 **3. Идеальное решение для предзагрузки**
+
+### **Шаг 1: Создайте Utilities**
+```kotlin
+object PreloadUtils {
+    
+    private val preloaded = AtomicBoolean(false)
+    
+    fun preloadCriticalClasses() {
+        if (preloaded.getAndSet(true)) return
+        
+        // 1. Spring компоненты
+        preloadSpringClasses()
+        
+        // 2. Утилитные классы
+        preloadUtilityClasses()
+        
+        // 3. Ваши классы со сложной инициализацией
+        preloadYourClasses()
+    }
+    
+    private fun preloadSpringClasses() {
+        arrayOf(
+            "org.springframework.context.annotation.Configuration",
+            "org.springframework.stereotype.Service",
+            "org.springframework.transaction.support.TransactionTemplate"
+        ).forEach { safePreload(it) }
+    }
+    
+    private fun preloadUtilityClasses() {
+        arrayOf(
+            "java.util.concurrent.locks.ReentrantLock",
+            "java.util.concurrent.ConcurrentHashMap",
+            "com.fasterxml.jackson.databind.ObjectMapper"
+        ).forEach { safePreload(it) }
+    }
+    
+    private fun preloadYourClasses() {
+        // Ваши классы с companion object init блоками
+        arrayOf(
+            "com.yourproject.config.DatabaseConfig",
+            "com.yourproject.utils.ValidationUtils",
+            "com.yourproject.services.*Service" // Паттерн
+        ).forEach { safePreload(it) }
+    }
+    
+    private fun safePreload(className: String) {
+        try {
+            if (className.endsWith(".*")) {
+                preloadPackage(className.removeSuffix(".*"))
+            } else {
+                Class.forName(className)
+            }
+        } catch (e: Exception) {
+            // Игнорируем - класс может не быть в classpath
+        }
+    }
+    
+    private fun preloadPackage(packageName: String) {
+        // Упрощенная реализация - можно использовать Reflection
+        println("Preloading package: $packageName")
+    }
+}
+```
+
+### **Шаг 2: Extension для автоматической предзагрузки**
+```kotlin
+class ClassPreloadingExtension : BeforeAllCallback {
+    
+    override fun beforeAll(context: ExtensionContext) {
+        PreloadUtils.preloadCriticalClasses()
+    }
+}
+```
+
+### **Шаг 3: Использование в тестах**
+```kotlin
+// Способ 1: Аннотация на классе
+@ExtendWith(ClassPreloadingExtension::class)
+@Execution(ExecutionMode.CONCURRENT)
+class MyConcurrentTest {
+    // тесты
+}
+
+// Способ 2: Глобальная регистрация в junit-platform.properties
+junit.jupiter.extensions.autodetection.enabled=true
+```
+
+## 🎯 **Ключевые моменты:**
+
+1. **Используйте Extension** - он безопаснее для параллельного выполнения
+2. **Kotlin uses companion object** вместо static блоков
+3. **Предзагружайте** Spring components, locks, utilities
+4. **Делайте предзагрузку один раз** на весь test run
+
+## 📊 **Пример класса с "static" инициализацией в Kotlin:**
+```kotlin
+class DatabaseConfig {
+    companion object {
+        // Аналог static field
+        val CONNECTION_POOL = createPool()
+        
+        // Аналог static block
+        init {
+            println("DatabaseConfig class loaded")
+            initializeConnectionPool()
+        }
+        
+        private fun createPool(): ConnectionPool {
+            // Сложная инициализация
+            return ConnectionPool()
+        }
+    }
+}
+
+// Предзагрузка такого класса
+PreloadUtils.safePreload("com.yourproject.config.DatabaseConfig")
+```
+
+---
+
+Отличный вопрос! Это **критически важная техника** для предотвращения дедлоков при параллельном запуске тестов. Давайте разберем детально.
+
+## 🐛 **Проблема: Дедлоки на ClassLoader**
+
+Когда JUnit 5 запускает тесты параллельно, несколько потоков одновременно пытаются:
+1. **Загружать классы** через `ClassLoader`
+2. **Инициализировать статические поля**
+3. **Выполнять static-блоки**
+
+ClassLoader internally синхронизирован, что приводит к дедлокам:
+
+```
+Found one Java-level deadlock:
+=============================
+"ForkJoinPool-1-worker-1":
+  waiting to lock monitor 0x00007f405c003c20 (object 0x00000000e0b7e3c0, a jdk.internal.loader.ClassLoaders$AppClassLoader),
+  which is held by "ForkJoinPool-1-worker-7"
+```
+
+## ✅ **Решение: Предзагрузка классов**
+
+### **1. Базовый подход: Класс для предзагрузки**
+
+```kotlin
+package com.yourproject.testutils
+
+import org.junit.jupiter.api.parallel.Execution
+import org.junit.jupiter.api.parallel.ExecutionMode
+import org.junit.jupiter.api.BeforeAll
+
+/**
+ * Предзагружает все классы, которые могут вызывать дедлоки
+ */
+object ClassPreloader {
+
+    @JvmStatic
+    @BeforeAll
+    fun preloadCriticalClasses() {
+        println("Preloading classes to avoid deadlocks...")
+        
+        // Предзагрузка Spring-компонентов
+        preloadSpringClasses()
+        
+        // Предзагрузка утилитных классов
+        preloadUtilityClasses()
+        
+        // Предзагрузка классов с static-инициализацией
+        preloadStaticInitializers()
+        
+        println("Classes preloaded successfully")
+    }
+
+    private fun preloadSpringClasses() {
+        arrayOf(
+            "org.springframework.context.annotation.Configuration",
+            "org.springframework.beans.factory.annotation.Autowired",
+            "org.springframework.stereotype.Service",
+            "org.springframework.stereotype.Component",
+            "com.yourproject.configuration.AppConfig",
+            "com.yourproject.services.*Service",
+            "com.yourproject.repositories.*Repository"
+        ).forEach { preloadClass(it) }
+    }
+
+    private fun preloadUtilityClasses() {
+        arrayOf(
+            "java.util.concurrent.locks.ReentrantLock",
+            "java.util.concurrent.locks.ReentrantReadWriteLock",
+            "java.util.Collections",
+            "java.time.LocalDateTime",
+            "com.fasterxml.jackson.databind.ObjectMapper"
+        ).forEach { preloadClass(it) }
+    }
+
+    private fun preloadStaticInitializers() {
+        // Классы со сложной static-инициализацией
+        arrayOf(
+            "org.slf4j.LoggerFactory",
+            "ch.qos.logback.classic.Logger",
+            "java.util.ResourceBundle",
+            "java.text.SimpleDateFormat"
+        ).forEach { preloadClass(it) }
+    }
+
+    private fun preloadClass(className: String) {
+        try {
+            if (className.endsWith(".*")) {
+                // Загрузка по паттерну (упрощенная версия)
+                val packageName = className.removeSuffix(".*")
+                preloadPackageClasses(packageName)
+            } else {
+                Class.forName(className)
+                println("Preloaded: $className")
+            }
+        } catch (e: ClassNotFoundException) {
+            println("Warning: Class not found - $className")
+        } catch (e: Exception) {
+            println("Error preloading $className: ${e.message}")
+        }
+    }
+
+    private fun preloadPackageClasses(packageName: String) {
+        // Упрощенная реализация - в реальности нужен reflection для сканирования package
+        println("Preloading package: $packageName.*")
+    }
+}
+```
+
+### **2. Использование в тестах**
+
+```kotlin
+import com.yourproject.testutils.ClassPreloader
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.parallel.Execution
+import org.junit.jupiter.api.parallel.ExecutionMode
+
+@Execution(ExecutionMode.CONCURRENT)
+class MyConcurrentTest {
+
+    companion object {
+        @JvmStatic
+        @BeforeAll
+        fun setup() {
+            ClassPreloader.preloadCriticalClasses()
+        }
+    }
+
+    @Test
+    fun test1() {
+        // Тест, который теперь безопасен
+    }
+
+    @Test 
+    fun test2() {
+        // Другой тест
+    }
+}
+```
+
+### **3. Автоматическая предзагрузка через Extension**
+
+```kotlin
+import org.junit.jupiter.api.extension.BeforeAllCallback
+import org.junit.jupiter.api.extension.ExtensionContext
+
+class ClassPreloadingExtension : BeforeAllCallback {
+    
+    override fun beforeAll(context: ExtensionContext) {
+        if (!classesPreloaded) {
+            synchronized(ClassPreloadingExtension::class.java) {
+                if (!classesPreloaded) {
+                    PreloadUtils.preloadAllCriticalClasses()
+                    classesPreloaded = true
+                }
+            }
+        }
+    }
+    
+    companion object {
+        @Volatile
+        private var classesPreloaded = false
+    }
+}
+
+// Использование
+@ExtendWith(ClassPreloadingExtension::class)
+@Execution(ExecutionMode.CONCURRENT)
+class MyConcurrentTests
+```
+
+### **4. Предзагрузка в junit-platform.properties**
+
+```properties
+# Предзагрузка перед всеми тестами
+junit.platform.execution.listeners.include=com.yourproject.extensions.ClassPreloadingListener
+
+# Параллельные настройки
+junit.jupiter.execution.parallel.enabled=true
+junit.jupiter.execution.parallel.mode.default=concurrent
+junit.jupiter.execution.parallel.config.strategy=fixed
+junit.jupiter.execution.parallel.config.fixed.parallelism=4
+```
+
+## 🎯 **Ключевые классы для предзагрузки:**
+
+### **Spring Framework:**
+- `@Configuration`, `@Service`, `@Component` классы
+- `ApplicationContext`, `BeanFactory`
+- Все ваши бины и конфигурации
+
+### **Утилитные классы:**
+```kotlin
+// Concurrent-классы
+java.util.concurrent.locks.ReentrantLock::class.java
+java.util.concurrent.ConcurrentHashMap::class.java
+
+// Logging
+org.slf4j.LoggerFactory::class.java
+ch.qos.logback.classic.Logger::class.java
+
+// JSON
+com.fasterxml.jackson.databind.ObjectMapper::class.java
+```
+
+### **Ваши собственные классы:**
+```kotlin
+// Все классы со static-инициализацией
+classOf<YourConfigClass>()
+classOf<YourUtilityClass>()
+classOf<YourServiceWithStaticBlock>()
+```
+
+## 🔧 **Как найти проблемные классы:**
+
+### **1. Анализ дедлоков:**
+Смотрите stack trace дедлока - какие классы участвуют в блокировке.
+
+### **2. Профилирование:**
+```bash
+java -XX:+TraceClassLoading -jar your-tests.jar
+```
+
+### **3. Статический анализ:**
+Ищите в коде:
+- `static {}` блоки
+- `synchronized` static методы
+- Сложную инициализацию static полей
+
+## 🚀 **Полный workflow предотвращения дедлоков:**
+
+1. **Предзагрузка** всех критических классов в `@BeforeAll`
+2. **Использование** `@Execution(ExecutionMode.CONCURRENT)`
+3. **Мониторинг** работы ForkJoinPool
+4. **Анализ** оставшихся проблем через thread dump
+
+---
 
